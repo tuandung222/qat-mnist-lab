@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-compare.py — Compare the baseline FP32 model with the QAT INT8 model.
+compare.py — Compare the baseline FP32 model with the QAT model.
 
 Usage:
     python compare.py      (after running both training scripts)
@@ -22,6 +22,7 @@ Prints a side-by-side table showing:
     • Saved file size (KB)
     • Test accuracy (%)
     • Average inference time per batch (ms)
+    • Quantization stats from the QAT model
 """
 
 import os
@@ -29,9 +30,8 @@ import time
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-import torch.ao.quantization as quant
 
-from model import SimpleCNN, QuantizedCNN
+from model import SimpleCNN, QATCNN
 
 # ── Constants ────────────────────────────────────────────────────────────────
 BATCH_SIZE = 128
@@ -97,18 +97,13 @@ def load_baseline() -> SimpleCNN:
     return model
 
 
-def load_quantized() -> QuantizedCNN:
-    model = QuantizedCNN()
-    model.fuse_model()
-    model.qconfig = quant.get_default_qat_qconfig("x86")
-    quant.prepare_qat(model, inplace=True)
-    model.eval()
-    quantized_model = quant.convert(model)
-    quantized_model.load_state_dict(
+def load_qat() -> QATCNN:
+    model = QATCNN()
+    model.load_state_dict(
         torch.load(QAT_PATH, map_location="cpu", weights_only=True)
     )
-    quantized_model.eval()
-    return quantized_model
+    model.eval()
+    return model
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -122,52 +117,68 @@ def main():
 
     print("Loading models …")
     fp32_model = load_baseline()
-    int8_model = load_quantized()
+    qat_model = load_qat()
 
     print("Evaluating accuracy …")
     fp32_acc = evaluate(fp32_model, test_loader)
-    int8_acc = evaluate(int8_model, test_loader)
+    qat_acc = evaluate(qat_model, test_loader)
 
     print("Measuring inference latency …\n")
     fp32_latency = measure_latency(fp32_model, test_loader)
-    int8_latency = measure_latency(int8_model, test_loader)
+    qat_latency = measure_latency(qat_model, test_loader)
 
     fp32_size = file_size_kb(BASELINE_PATH)
-    int8_size = file_size_kb(QAT_PATH)
+    qat_size = file_size_kb(QAT_PATH)
 
     # ── Pretty-print comparison table ────────────────────────────────────
-    header = f"{'Metric':<30} {'FP32 Baseline':>15} {'QAT INT8':>15} {'Δ':>10}"
+    header = f"{'Metric':<30} {'FP32 Baseline':>15} {'QAT Model':>15} {'Δ':>10}"
     sep = "─" * len(header)
 
     print("=" * len(header))
-    print("  📊  Model Comparison: FP32 vs QAT INT8")
+    print("  📊  Model Comparison: FP32 Baseline vs QAT (from-scratch)")
     print("=" * len(header))
     print(header)
     print(sep)
     print(
         f"{'Model file size (KB)':<30}"
         f" {fp32_size:>14.1f}"
-        f" {int8_size:>14.1f}"
-        f" {(int8_size / fp32_size) * 100:>9.1f}%"
+        f" {qat_size:>14.1f}"
+        f" {(qat_size / fp32_size) * 100:>9.1f}%"
     )
     print(
         f"{'Test accuracy (%)':<30}"
         f" {fp32_acc:>14.2f}"
-        f" {int8_acc:>14.2f}"
-        f" {int8_acc - fp32_acc:>+9.2f}"
+        f" {qat_acc:>14.2f}"
+        f" {qat_acc - fp32_acc:>+9.2f}"
     )
     print(
         f"{'Avg batch latency (ms)':<30}"
         f" {fp32_latency:>14.2f}"
-        f" {int8_latency:>14.2f}"
-        f" {((int8_latency - fp32_latency) / fp32_latency) * 100:>+8.1f}%"
+        f" {qat_latency:>14.2f}"
+        f" {((qat_latency - fp32_latency) / fp32_latency) * 100:>+8.1f}%"
     )
     print(sep)
+
+    # ── Quantization stats from QAT model ────────────────────────────────
+    print("\n📐  Quantization parameters learned during QAT:")
+    print("-" * 70)
+    print(f"  {'Layer':<40} {'Scale':>10} {'ZP':>8} {'Min':>10} {'Max':>10}")
+    print("-" * 70)
+    for stat in qat_model.get_quantization_stats():
+        print(
+            f"  {stat['name']:<40}"
+            f" {stat['scale']:>10.6f}"
+            f" {stat['zero_point']:>8.1f}"
+            f" {stat['observed_min']:>10.4f}"
+            f" {stat['observed_max']:>10.4f}"
+        )
+    print("-" * 70)
+
     print(
-        f"\n🗜️  Size reduction: {fp32_size / int8_size:.1f}×  smaller  "
-        f"({fp32_size:.0f} KB → {int8_size:.0f} KB)"
+        f"\n📝  Note: QAT model file is larger because it stores FP32 weights"
+        f"\n    + observer state. In production, weights would be converted"
+        f"\n    to INT8 using the learned scale/zp → ~4× smaller."
     )
-    print(f"🎯  Accuracy delta: {int8_acc - fp32_acc:+.2f}%")
     print()
 
 

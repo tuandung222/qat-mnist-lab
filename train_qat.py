@@ -13,26 +13,20 @@
 # limitations under the License.
 
 """
-train_qat.py — Quantization-Aware Training (QAT) on MNIST.
+train_qat.py — Quantization-Aware Training FROM SCRATCH (no torch.ao.quantization).
 
 Usage:
     python train_qat.py          (after running train_baseline.py first)
 
-What it does:
-    1. Creates a QuantizedCNN and loads the pre-trained FP32 weights.
-    2. Fuses Conv+ReLU / Linear+ReLU layers.
-    3. Attaches a QAT-specific qconfig (fake-quantized weights & activations).
-    4. Calls prepare_qat() to insert fake-quant observers.
-    5. Fine-tunes for 3 epochs so the model learns to compensate for
-       quantization noise.
-    6. Calls convert() to produce a real INT8 model.
-    7. Evaluates and saves the quantized model to  qat_model.pth .
+Pipeline:
+    1. Load pre-trained SimpleCNN weights into QATCNN.
+    2. Fine-tune for a few epochs — the FakeQuantize modules inside each
+       QATConv2d/QATLinear simulate INT8 rounding during forward,
+       while gradients flow through via STE during backward.
+    3. After training, export the quantization parameters (scale, zero_point)
+       and save the model.
 
-Key concepts illustrated:
-    • QuantStub / DeQuantStub
-    • fuse_modules()
-    • prepare_qat()  vs  prepare() (PTQ)
-    • convert()
+Everything is implemented from scratch in model.py — no torch.ao is used.
 """
 
 import os
@@ -41,9 +35,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-import torch.ao.quantization as quant
 
-from model import SimpleCNN, QuantizedCNN
+from model import SimpleCNN, QATCNN
 
 # ── Hyper-parameters ─────────────────────────────────────────────────────────
 BATCH_SIZE = 128
@@ -67,18 +60,52 @@ def get_dataloaders():
     return train_loader, test_loader
 
 
-# ── Training loop (same as baseline) ─────────────────────────────────────────
+# ── Training loop ────────────────────────────────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, epoch):
+    """
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ PSEUDOCODE — QAT Training Step:                                 │
+    │                                                                  │
+    │  for each batch (images, labels):                               │
+    │      # FORWARD PASS:                                            │
+    │      #   Mỗi QATConv2d/QATLinear tự động:                       │
+    │      #   1. Observer cập nhật running_min/max của activation     │
+    │      #   2. Fake-quantize activation (round → clamp → scale)    │
+    │      #   3. Observer cập nhật running_min/max của weight         │
+    │      #   4. Fake-quantize weight                                │
+    │      #   5. Tính conv2d/linear với giá trị đã fake-quantize     │
+    │      #                                                          │
+    │      outputs = model(images)                                    │
+    │      loss = cross_entropy(outputs, labels)                      │
+    │                                                                  │
+    │      # BACKWARD PASS:                                           │
+    │      #   Gradient chảy ngược qua mỗi layer:                    │
+    │      #   1. Qua fake_quantize → STE: gradient × mask            │
+    │      #      (mask=1 nếu giá trị KHÔNG bị clamp,                │
+    │      #       mask=0 nếu giá trị BỊ clamp/saturate)             │
+    │      #   2. Qua conv2d/linear → gradient bình thường            │
+    │      #   3. Weight được cập nhật: w = w - lr * grad            │
+    │      #   (Weight cập nhật ở FP32, nhưng forward pass tiếp theo  │
+    │      #    sẽ lại fake-quantize weight → mô hình học cách        │
+    │      #    tối ưu weight sao cho KHI BỊ quantize vẫn tốt)       │
+    │      #                                                          │
+    │      loss.backward()                                            │
+    │      optimizer.step()                                           │
+    └──────────────────────────────────────────────────────────────────┘
+    """
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
     for images, labels in loader:
-        # QAT runs on CPU only (PyTorch eager-mode quantization limitation)
         optimizer.zero_grad()
+
+        # Forward: fake quantization happens inside each QAT layer
         outputs = model(images)
         loss = criterion(outputs, labels)
+
+        # Backward: STE allows gradients to flow through fake_quantize
         loss.backward()
         optimizer.step()
 
@@ -108,86 +135,83 @@ def evaluate(model, loader):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 60)
-    print("  Quantization-Aware Training (QAT) — QuantizedCNN on MNIST")
-    print("=" * 60)
+    print("=" * 70)
+    print("  Quantization-Aware Training — FROM SCRATCH (no torch.ao)")
+    print("=" * 70)
 
     # ------------------------------------------------------------------
-    # Step 1: Load the pre-trained FP32 weights into QuantizedCNN
+    # Step 1: Load pre-trained FP32 weights into QAT model
     # ------------------------------------------------------------------
     if not os.path.exists(BASELINE_PATH):
         print(f"❌  Baseline model not found at '{BASELINE_PATH}'.")
         print("   Run  python train_baseline.py  first.")
         return
 
-    model = QuantizedCNN()
+    qat_model = QATCNN()
 
-    # Load state_dict from SimpleCNN — keys match (same layer names).
-    state_dict = torch.load(BASELINE_PATH, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict, strict=False)  # strict=False skips quant/dequant
-    print("✅  Loaded pre-trained baseline weights.")
-
-    # ------------------------------------------------------------------
-    # Step 2: Fuse layers
-    #   Conv2d + ReLU  →  ConvReLU2d   (single fused module)
-    #   Linear + ReLU  →  LinearReLU   (single fused module)
-    # This is REQUIRED before prepare_qat so that observers see the
-    # fused operation instead of separate ones.
-    # ------------------------------------------------------------------
-    model.fuse_model()
-    print("🔗  Fused Conv+ReLU and Linear+ReLU layers.")
+    # Load SimpleCNN weights → map to QATCNN naming convention
+    baseline_state = torch.load(BASELINE_PATH, map_location="cpu", weights_only=True)
+    qat_model.load_pretrained(baseline_state)
+    print("✅  Loaded pre-trained baseline weights into QATCNN.")
+    print()
 
     # ------------------------------------------------------------------
-    # Step 3: Attach QAT qconfig
-    #   qconfig specifies HOW weights and activations are fake-quantized
-    #   during training.  get_default_qat_qconfig("x86") is a good
-    #   default for desktop CPUs.
+    # Step 2: Print model structure (see the FakeQuantize modules)
     # ------------------------------------------------------------------
-    model.qconfig = quant.get_default_qat_qconfig("x86")
-    print(f"📐  QAT qconfig: {model.qconfig}")
+    print("📐  Model structure (note the FakeQuantize inside each layer):")
+    print("-" * 60)
+    for name, module in qat_model.named_modules():
+        if name:  # skip root module
+            indent = "  " * name.count(".")
+            print(f"  {indent}{name}: {module.__class__.__name__}")
+    print("-" * 60)
+    print()
 
     # ------------------------------------------------------------------
-    # Step 4: prepare_qat()  — inserts fake-quant modules
-    #   After this call the model's forward pass will simulate INT8
-    #   arithmetic while still using FP32 under the hood so that
-    #   gradients can flow and the model can adapt.
-    # ------------------------------------------------------------------
-    quant.prepare_qat(model, inplace=True)
-    print("🔧  Model prepared for QAT (fake-quant observers inserted).\n")
-
-    # ------------------------------------------------------------------
-    # Step 5: Fine-tune with fake quantization
+    # Step 3: Fine-tune with QAT
     # ------------------------------------------------------------------
     train_loader, test_loader = get_dataloaders()
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(qat_model.parameters(), lr=LEARNING_RATE)
 
-    print(f"Training for {QAT_EPOCHS} QAT epochs …")
+    # Evaluate BEFORE QAT fine-tuning (with random observer states)
+    baseline_acc = evaluate(qat_model, test_loader)
+    print(f"📊  Accuracy before QAT fine-tuning: {baseline_acc:.2f}%")
+    print(f"    (Lower than baseline because observers haven't calibrated yet)")
+    print()
+
+    print(f"🏋️  Fine-tuning for {QAT_EPOCHS} QAT epochs …")
     for epoch in range(1, QAT_EPOCHS + 1):
-        train_one_epoch(model, train_loader, criterion, optimizer, epoch)
-
-    # Evaluate while still in fake-quant mode
-    fake_quant_acc = evaluate(model, test_loader)
-    print(f"\n📊  Fake-quant test accuracy: {fake_quant_acc:.2f}%")
+        train_one_epoch(qat_model, train_loader, criterion, optimizer, epoch)
 
     # ------------------------------------------------------------------
-    # Step 6: convert()  — replace fake-quant ops with real INT8 ops
-    #   After conversion the model is a true quantized model that runs
-    #   with integer arithmetic on supported backends.
+    # Step 4: Evaluate after QAT
     # ------------------------------------------------------------------
-    model.eval()  # must be in eval mode before convert
-    quantized_model = quant.convert(model)
-    print("⚡  Model converted to INT8 (real quantized).")
-
-    # Evaluate the converted INT8 model
-    int8_acc = evaluate(quantized_model, test_loader)
-    print(f"📊  INT8 test accuracy: {int8_acc:.2f}%")
+    qat_acc = evaluate(qat_model, test_loader)
+    print(f"\n📊  QAT test accuracy: {qat_acc:.2f}%")
 
     # ------------------------------------------------------------------
-    # Step 7: Save the quantized model
+    # Step 5: Show learned quantization parameters
     # ------------------------------------------------------------------
-    torch.save(quantized_model.state_dict(), SAVE_PATH)
-    print(f"💾  Quantized model saved to {SAVE_PATH}")
+    print("\n📐  Learned quantization parameters per layer:")
+    print("-" * 70)
+    print(f"  {'Layer':<40} {'Scale':>10} {'ZP':>8} {'Min':>10} {'Max':>10}")
+    print("-" * 70)
+    for stat in qat_model.get_quantization_stats():
+        print(
+            f"  {stat['name']:<40}"
+            f" {stat['scale']:>10.6f}"
+            f" {stat['zero_point']:>8.1f}"
+            f" {stat['observed_min']:>10.4f}"
+            f" {stat['observed_max']:>10.4f}"
+        )
+    print("-" * 70)
+
+    # ------------------------------------------------------------------
+    # Step 6: Save model
+    # ------------------------------------------------------------------
+    torch.save(qat_model.state_dict(), SAVE_PATH)
+    print(f"\n💾  QAT model saved to {SAVE_PATH}")
 
 
 if __name__ == "__main__":

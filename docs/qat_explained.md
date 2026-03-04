@@ -1,546 +1,762 @@
 # 📘 Quantization-Aware Training (QAT) — Hướng Dẫn Chi Tiết
 
-> Tài liệu giáo dục này giải thích từng bước về **Quantization-Aware Training** trong deep learning, sử dụng PyTorch và mạng CNN đơn giản trên tập MNIST làm ví dụ minh hoạ.
+> **Tài liệu giáo dục** giải thích **từ gốc rễ** về Quantization-Aware Training.
+> Mọi thứ được implement from scratch — **KHÔNG dùng `torch.ao.quantization`**.
+> Có mã giả (pseudocode) cho mọi thành phần.
 
 ---
 
 ## Mục lục
 
-1. [Tổng quan về Quantization](#1-tổng-quan-về-quantization)
+1. [Quantization là gì?](#1-quantization-là-gì)
 2. [Tại sao cần Quantization?](#2-tại-sao-cần-quantization)
-3. [Các phương pháp Quantization](#3-các-phương-pháp-quantization)
-4. [Deep dive: Quantization-Aware Training](#4-deep-dive-quantization-aware-training)
-5. [Kiến trúc mô hình trong project này](#5-kiến-trúc-mô-hình-trong-project-này)
-6. [Giải thích từng bước trong code](#6-giải-thích-từng-bước-trong-code)
-7. [Kết quả mẫu & phân tích](#7-kết-quả-mẫu--phân-tích)
-8. [Các câu hỏi thường gặp (FAQ)](#8-các-câu-hỏi-thường-gặp-faq)
-9. [Tài liệu tham khảo](#9-tài-liệu-tham-khảo)
+3. [Fake Quantize — trái tim của QAT](#3-fake-quantize--trái-tim-của-qat)
+4. [Mối liên hệ PTQ ↔ QAT](#4-mối-liên-hệ-ptq--qat)
+5. [Activation và Weight trong QAT](#5-activation-và-weight-trong-qat)
+6. [Straight-Through Estimator (STE)](#6-straight-through-estimator-ste)
+7. [Observer — thu thập thống kê](#7-observer--thu-thập-thống-kê)
+8. [Kiến trúc from-scratch trong project](#8-kiến-trúc-from-scratch-trong-project)
+9. [Giải thích code từng bước](#9-giải-thích-code-từng-bước)
+10. [FAQ](#10-faq)
+11. [Tài liệu tham khảo](#11-tài-liệu-tham-khảo)
 
 ---
 
-## 1. Tổng quan về Quantization
+## 1. Quantization là gì?
 
-### 1.1 Quantization là gì?
+### 1.1 Định nghĩa
 
-**Quantization** (lượng tử hoá) là kỹ thuật giảm **độ chính xác số học** (numerical precision) của các tham số và phép tính trong mạng neural. Cụ thể:
-
-```
-FP32 (32-bit floating point)  →  INT8 (8-bit integer)
-```
-
-Mỗi weight và activation trong mô hình, thay vì được lưu dưới dạng số thực 32-bit, sẽ được **ánh xạ** (map) sang một số nguyên 8-bit thông qua công thức:
+**Quantization** (lượng tử hoá) là quá trình ánh xạ giá trị từ **không gian liên tục** (floating point) sang **không gian rời rạc** (integer).
 
 ```
-x_quantized = round(x_real / scale) + zero_point
+Thế giới thực (FP32):    0.0000  0.0001  0.0002  ...  1.5847  ...
+                           ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+Thế giới quantized (INT8): 0      1       2      ...   158    ...
 ```
 
-Trong đó:
-- **`scale`** (hệ số tỷ lệ): xác định khoảng giá trị thực mà mỗi "bước" INT8 đại diện
-- **`zero_point`** (điểm gốc): giá trị INT8 tương ứng với 0.0 trong không gian thực
-- **`round()`**: làm tròn đến số nguyên gần nhất — đây chính là nguồn gốc của **quantization error**
-
-### 1.2 Ví dụ trực quan
-
-Giả sử một weight có giá trị `0.73` và ta có `scale=0.01`, `zero_point=128`:
+### 1.2 Công thức cốt lõi
 
 ```
-x_q = round(0.73 / 0.01) + 128 = round(73) + 128 = 201
-
-Khi de-quantize (giải lượng tử):
-x_dq = (201 - 128) × 0.01 = 0.73   ✅ Chính xác!
+┌─────────────────────────────────────────────────────────────┐
+│  QUANTIZE (số thực → số nguyên):                           │
+│                                                             │
+│    x_int = clamp(round(x_real / scale) + zero_point,       │
+│                  q_min, q_max)                              │
+│                                                             │
+│  DEQUANTIZE (số nguyên → số thực):                         │
+│                                                             │
+│    x_real ≈ (x_int - zero_point) × scale                   │
+│                                                             │
+│  Trong đó:                                                  │
+│    scale      = (max_val - min_val) / (q_max - q_min)       │
+│    zero_point = q_min - round(min_val / scale)              │
+│    q_min, q_max = phạm vi INT8 (ví dụ: 0..255 hoặc -128..127) │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Nhưng nếu giá trị là `0.735`:
+### 1.3 Ví dụ bằng số
+
+Giả sử một tensor weight có giá trị thuộc khoảng `[-0.5, 1.2]`, và ta dùng **unsigned INT8** (`q_min=0, q_max=255`):
 
 ```
-x_q = round(0.735 / 0.01) + 128 = round(73.5) + 128 = 74 + 128 = 202
-x_dq = (202 - 128) × 0.01 = 0.74   ⚠️ Sai lệch 0.005 (quantization error)
+scale      = (1.2 - (-0.5)) / (255 - 0) = 1.7 / 255 ≈ 0.00667
+
+zero_point = 0 - round(-0.5 / 0.00667) = 0 - round(-75) = 75
+
+Quantize giá trị 0.73:
+  x_int = clamp(round(0.73 / 0.00667) + 75, 0, 255)
+        = clamp(round(109.4) + 75, 0, 255)
+        = clamp(109 + 75, 0, 255)
+        = clamp(184, 0, 255)
+        = 184  ✅
+
+Dequantize:
+  x_real ≈ (184 - 75) × 0.00667 = 109 × 0.00667 ≈ 0.7270
+
+Sai lệch: |0.73 - 0.727| = 0.003  ← đây là quantization error
 ```
 
-> Mặc dù sai lệch này rất nhỏ cho một tham số, nhưng khi nhân lên hàng triệu tham số, nó có thể ảnh hưởng đáng kể đến accuracy.
+> **Quantization error** là sai lệch do phép làm tròn. Nó nhỏ cho một tham số, nhưng tích luỹ qua hàng triệu tham số và nhiều layer.
 
 ---
 
 ## 2. Tại sao cần Quantization?
 
-### 2.1 Lợi ích
-
-| Lợi ích | Giải thích |
-|---------|-----------|
-| 📦 **Giảm kích thước mô hình** | FP32: 4 bytes/param → INT8: 1 byte/param → **giảm ~4×** |
-| ⚡ **Tăng tốc inference** | Phép tính INT8 nhanh hơn FP32 trên hầu hết CPU/NPU |
-| 🔋 **Tiết kiệm năng lượng** | Ít bộ nhớ truy cập, ít phép tính → tiêu thụ ít điện hơn |
-| 📱 **Deploy trên edge** | Mô hình nhỏ gọn, chạy được trên điện thoại, IoT, vi điều khiển |
-
-### 2.2 Khi nào nên dùng?
-
 ```
-Training (GPU, cloud)           →  FP32 hoặc FP16/BF16
-                                          ↓
-                  Quantization (FP32 → INT8)
-                                          ↓
-Deployment (CPU, mobile, edge)  →  INT8 (nhỏ, nhanh)
+┌─────────────────────────────────────────────────────────────┐
+│                    So sánh FP32 vs INT8                     │
+├──────────────────────┬──────────────┬───────────────────────┤
+│ Tiêu chí             │ FP32         │ INT8                  │
+├──────────────────────┼──────────────┼───────────────────────┤
+│ Kích thước/param     │ 4 bytes      │ 1 byte                │
+│ Mô hình 10M params  │ ~40 MB       │ ~10 MB                │
+│ Phép nhân            │ FP multiply  │ INT multiply (nhanh!) │
+│ Phần cứng tối ưu     │ GPU          │ CPU, NPU, MCU         │
+│ Deploy mobile        │ Khó          │ Dễ                    │
+│ Tiêu thụ điện        │ Cao          │ Thấp                  │
+└──────────────────────┴──────────────┴───────────────────────┘
 ```
 
-Quantization đặc biệt quan trọng khi:
-- Deploy mô hình lên **thiết bị di động** (Android, iOS)
-- Chạy trên **vi điều khiển** (MCU) với bộ nhớ giới hạn
-- Giảm **chi phí server** cho inference trên cloud
-- Cần **latency thấp** cho ứng dụng real-time
+Kết luận: Quantization giúp mô hình **nhỏ hơn ~4×**, **nhanh hơn ~2×** trên CPU, và **tiết kiệm năng lượng** — lý tưởng cho edge deployment.
 
 ---
 
-## 3. Các phương pháp Quantization
+## 3. Fake Quantize — trái tim của QAT
 
-### 3.1 Post-Training Quantization (PTQ)
+### 3.1 Vấn đề: `round()` giết gradient
 
-**Ý tưởng**: Sau khi train xong mô hình FP32, ta quantize trực tiếp sang INT8 **mà không cần train lại**.
-
-```
-┌─────────────────┐       ┌──────────────────┐       ┌──────────────┐
-│ Trained FP32    │ ────► │  Calibrate with   │ ────► │ Quantized    │
-│ Model           │       │  sample data      │       │ INT8 Model   │
-└─────────────────┘       └──────────────────┘       └──────────────┘
-```
-
-**Ưu điểm**: Nhanh, đơn giản, không cần training data đầy đủ.
-**Nhược điểm**: Có thể giảm accuracy đáng kể, đặc biệt với mô hình nhỏ.
-
-### 3.2 Quantization-Aware Training (QAT)  ← **Focus của project này**
-
-**Ý tưởng**: Trong quá trình training (hoặc fine-tuning), ta **mô phỏng** (simulate) hiệu ứng quantization để mô hình **học cách bù đắp** (compensate) cho quantization error.
+Trong training, ta cần **backpropagation** — tức cần gradient. Nhưng phép `round()` có vấn đề:
 
 ```
-┌─────────────────┐       ┌──────────────────┐       ┌──────────────┐       ┌──────────────┐
-│ Pre-trained     │ ────► │  Insert fake      │ ────► │ Fine-tune    │ ────► │ Convert to   │
-│ FP32 Model      │       │  quantization     │       │ (QAT)        │       │ real INT8    │
-└─────────────────┘       └──────────────────┘       └──────────────┘       └──────────────┘
+round(x):    ──┐  ┌──┐  ┌──┐  ┌──     (bậc thang)
+               └──┘  └──┘  └──┘
+
+d/dx round(x) = 0   (gần như mọi nơi)
+
+→ Gradient = 0 → Weight KHÔNG được cập nhật → KHÔNG THỂ TRAIN!
 ```
 
-**Ưu điểm**: Accuracy cao hơn PTQ vì mô hình đã "quen" với quantization noise.
-**Nhược điểm**: Cần thêm vài epoch fine-tuning.
+### 3.2 Giải pháp: Fake Quantize
 
-### 3.3 So sánh PTQ vs QAT
+**Ý tưởng cốt lõi**: Trong **forward pass**, ta mô phỏng quantization (round + clamp). Trong **backward pass**, ta **giả vờ** phép round không tồn tại → gradient chảy thẳng qua.
 
 ```
-Accuracy
-  ▲
-  │  ████ FP32 (baseline)
-  │  ████████████████████████████████████████  99.1%
-  │
-  │  ████ QAT INT8
-  │  ███████████████████████████████████████   98.9%  (giảm ~0.2%)
-  │
-  │  ████ PTQ INT8
-  │  ████████████████████████████████████      97.5%  (giảm ~1.6%)
-  │
-  └──────────────────────────────────────────►
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  MÃ GIẢ — FAKE QUANTIZE:                                        │
+│                                                                  │
+│  function FAKE_QUANTIZE(x, scale, zero_point, q_min, q_max):    │
+│                                                                  │
+│      ──── FORWARD ────                                           │
+│      x_int  = clamp(round(x / scale) + zero_point, q_min, q_max)│
+│      x_fake = (x_int - zero_point) * scale                      │
+│      return x_fake                                               │
+│      // Kết quả: vẫn là FP32, nhưng chỉ chứa giá trị           │
+│      // "có thể biểu diễn" bởi INT8                             │
+│      // Tức là x_fake ∈ {(i - zp) * s | i ∈ [q_min, q_max]}    │
+│                                                                  │
+│      ──── BACKWARD ────                                          │
+│      // Straight-Through Estimator:                              │
+│      q_min_real = (q_min - zero_point) * scale                   │
+│      q_max_real = (q_max - zero_point) * scale                   │
+│      mask = (x >= q_min_real) AND (x <= q_max_real)              │
+│      grad_input = grad_output * mask                             │
+│      return grad_input                                           │
+│      // Gradient được chuyển nguyên vẹn nếu x nằm trong vùng    │
+│      // quantizable, và bị chặn (=0) nếu x bị clamp            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-> **Kết luận**: QAT cho accuracy gần FP32 hơn nhiều so với PTQ, đặc biệt quan trọng với mô hình nhỏ hoặc task nhạy cảm.
+### 3.3 Tại sao gọi là "fake"?
+
+| Thuộc tính | Quantize thật | Fake quantize |
+|-----------|:---:|:---:|
+| Kiểu dữ liệu output | INT8 | FP32 |
+| Giá trị bị làm tròn? | ✅ | ✅ |
+| Gradient chảy qua? | ❌ | ✅ (nhờ STE) |
+| Dùng khi nào? | Inference | Training (QAT) |
+
+Nói cách khác: **fake quantize = quantize + dequantize ngay lập tức**, giữ kiểu FP32 để gradient vẫn chảy, nhưng giá trị đã bị "làm hỏng" giống như khi bị quantize thật.
+
+### 3.4 Hình dung trực quan
+
+```
+             Giá trị gốc (FP32)
+             ┃
+    0.01  0.03  0.07  0.08  0.12  0.15  0.18  0.22
+     │     │     │     │     │     │     │     │
+     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼
+   ┌─────────────────────────────────────────────────┐
+   │            FAKE QUANTIZE (scale=0.05)           │
+   │                                                  │
+   │  round(0.01/0.05)=0  → dequant → 0.00          │
+   │  round(0.03/0.05)=1  → dequant → 0.05          │
+   │  round(0.07/0.05)=1  → dequant → 0.05          │
+   │  round(0.08/0.05)=2  → dequant → 0.10          │
+   │  round(0.12/0.05)=2  → dequant → 0.10          │
+   │  round(0.15/0.05)=3  → dequant → 0.15          │
+   │  round(0.18/0.05)=4  → dequant → 0.20          │
+   │  round(0.22/0.05)=4  → dequant → 0.20          │
+   └─────────────────────────────────────────────────┘
+     │     │     │     │     │     │     │     │
+     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼
+    0.00  0.05  0.05  0.10  0.10  0.15  0.20  0.20
+             ┃
+             Giá trị sau fake quantize (vẫn FP32, nhưng "bậc thang")
+```
+
+> **Giá trị output vẫn là FP32** nhưng đã bị "kéo" vào các mức rời rạc — chính xác giống như khi quantize sang INT8 rồi dequantize lại.
 
 ---
 
-## 4. Deep dive: Quantization-Aware Training
+## 4. Mối liên hệ PTQ ↔ QAT
 
-### 4.1 Fake Quantization (Lượng tử hoá giả)
-
-Đây là **cơ chế cốt lõi** của QAT. Trong forward pass:
+### 4.1 PTQ (Post-Training Quantization) — Quantize SAU khi train
 
 ```
-                    Forward Pass (Training)
-                    ═══════════════════════
-
-Input (FP32)
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│         Fake Quantize (simulate)        │
-│                                         │
-│   x_fq = dequant(quant(x))             │
-│        = (round(x/s) + z - z) × s      │
-│        = round(x/s) × s                │
-│                                         │
-│   → Vẫn là FP32 nhưng đã bị "làm tròn" │
-│     giống như INT8                       │
-└─────────────────────────────────────────┘
-    │
-    ▼
-Conv2d / Linear (FP32 arithmetic)
-    │
-    ▼
-Output (FP32, nhưng mang "dấu ấn" quantization)
+┌────────────────────────────────────────────────────────────────┐
+│  MÃ GIẢ — POST-TRAINING QUANTIZATION (PTQ):                  │
+│                                                                │
+│  // Bước 1: Train mô hình bình thường                         │
+│  model = train_fp32(dataset)        // output: FP32 model      │
+│                                                                │
+│  // Bước 2: Calibrate — chạy vài batch qua model              │
+│  //   để observer thu thập min/max của mỗi layer              │
+│  for batch in calibration_data:                                │
+│      model.forward(batch)           // forward only, no grad   │
+│      observer.update(activations)   // ghi nhận min/max        │
+│                                                                │
+│  // Bước 3: Tính scale/zero_point từ statistics               │
+│  for each layer:                                               │
+│      scale, zp = compute_qparams(observer.min, observer.max)  │
+│                                                                │
+│  // Bước 4: Quantize weight trực tiếp                         │
+│  for each layer:                                               │
+│      layer.weight_int8 = quantize(layer.weight_fp32, scale, zp)│
+│                                                                │
+│  // Kết quả: mô hình INT8 — KHÔNG cần thêm training          │
+│  // Nhưng accuracy có thể giảm vì model chưa bao giờ "thấy"  │
+│  // quantization error trong quá trình training                │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-**Tại sao gọi là "fake"?**
-- Dữ liệu **vẫn là FP32** (cần cho backpropagation)
-- Nhưng đã bị **làm tròn giống INT8** → mô hình "cảm nhận" được quantization error
-- Gradient vẫn chảy bình thường qua **Straight-Through Estimator (STE)**
-
-### 4.2 Straight-Through Estimator (STE)
-
-Phép `round()` có đạo hàm = 0 gần như mọi nơi, nên không thể backpropagate qua được. STE giải quyết bằng cách:
+### 4.2 QAT (Quantization-Aware Training) — Quantize TRONG LÚC train
 
 ```
-Forward:   x_out = round(x)        ← dùng round() thực sự
-Backward:  ∂L/∂x = ∂L/∂x_out × 1  ← giả vờ round() là hàm đồng nhất (identity)
+┌────────────────────────────────────────────────────────────────┐
+│  MÃ GIẢ — QUANTIZATION-AWARE TRAINING (QAT):                 │
+│                                                                │
+│  // Bước 1: Bắt đầu từ mô hình FP32 đã pre-train (hoặc mới) │
+│  model = load_pretrained_fp32()                                │
+│                                                                │
+│  // Bước 2: Chèn fake_quantize vào mỗi layer                 │
+│  for each layer in model:                                      │
+│      layer = wrap_with_fake_quantize(layer)                    │
+│                                                                │
+│  // Bước 3: Fine-tune VỚI fake quantization                   │
+│  for epoch in range(few_epochs):                               │
+│      for batch in training_data:                               │
+│                                                                │
+│          // FORWARD: mỗi layer tự động fake-quantize           │
+│          //   activation và weight                             │
+│          output = model.forward(batch)                         │
+│          loss = criterion(output, labels)                      │
+│                                                                │
+│          // BACKWARD: STE cho phép gradient chảy qua           │
+│          //   fake_quantize → weight được cập nhật (FP32)      │
+│          //   → epoch tiếp, weight lại bị fake_quantize        │
+│          //   → model học cách TỐI ƯU ĐỂ CHỊU ĐỰNG quant    │
+│          loss.backward()                                       │
+│          optimizer.step()                                      │
+│                                                                │
+│  // Bước 4: Convert sang INT8 thật                             │
+│  //   Dùng scale/zp từ observer → quantize weight thành INT8  │
+│  final_model = convert_to_int8(model)                         │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-Nhờ STE, gradient "chảy xuyên qua" (straight through) phép round, cho phép mô hình học cách điều chỉnh weights để **tối thiểu hoá loss ngay cả khi bị quantize**.
+### 4.3 So sánh — CÙNG CƠ CHẾ, KHÁC THỜI ĐIỂM
 
-### 4.3 Observer & QConfig
+```
+                PTQ                              QAT
+                ═══                              ═══
 
-**Observer** theo dõi (observe) phân phối giá trị của activations/weights trong quá trình training để xác định `scale` và `zero_point` tối ưu.
+  ┌──────────┐                       ┌──────────┐
+  │ Train    │ ← FP32 thuần         │ Train    │ ← FP32 thuần
+  │ (bình   │   (không biết gì     │ (bình   │   (pre-training)
+  │ thường)  │    về quantization)   │ thường)  │
+  └────┬─────┘                       └────┬─────┘
+       │                                   │
+       ▼                                   ▼
+  ┌──────────┐                       ┌──────────────┐
+  │Calibrate │ ← observer xem       │ Fine-tune    │ ← fake quantize
+  │(forward  │   min/max, tính      │ VỚI fake     │   trong forward,
+  │ only)    │   scale/zp           │ quantize     │   STE trong backward
+  └────┬─────┘                       │ (vài epoch) │
+       │                              └────┬────────┘
+       │                                   │
+       ▼                                   ▼
+  ┌──────────┐                       ┌──────────┐
+  │ Convert  │ ← quantize weight    │ Convert  │ ← quantize weight
+  │ to INT8  │   trực tiếp          │ to INT8  │   (model ĐÃ quen)
+  └──────────┘                       └──────────┘
+
+ ✦ Cùng dùng scale/zp              ✦ Cùng dùng scale/zp
+ ✦ Cùng dùng observer              ✦ Cùng dùng observer
+ ✦ NHƯNG: model CHƯA BAO GIỜ      ✦ NHƯNG: model ĐÃ LUYỆN TẬP
+   thấy quantization error            với quantization error
+   → accuracy giảm nhiều hơn          → accuracy giảm ít
+```
+
+> **Kết luận**: PTQ và QAT **dùng cùng cơ chế toán học** (scale, zero_point, quantize, dequantize). Sự khác biệt duy nhất là QAT cho mô hình **cơ hội thích nghi** với quantization error thông qua fake quantize + fine-tuning.
+
+---
+
+## 5. Activation và Weight trong QAT
+
+### 5.1 Activation là gì?
+
+```
+Trong neural network, "activation" = OUTPUT của mỗi layer:
+
+  Input → [Conv2d] → activation₁ → [ReLU] → activation₂ → [MaxPool] → activation₃
+                       ^^^^^^^^               ^^^^^^^^                   ^^^^^^^^
+                       đây là                 đây là                    đây là
+                       activation             activation                activation
+```
+
+Activation là **dữ liệu chảy qua mạng** — nó thay đổi mỗi batch. Khác với weight (cố định trong inference), activation **phụ thuộc vào input**.
+
+### 5.2 Weight vs Activation — khác nhau cơ bản
+
+```
+┌────────────────────────┬──────────────────┬──────────────────────┐
+│                        │ WEIGHT           │ ACTIVATION           │
+├────────────────────────┼──────────────────┼──────────────────────┤
+│ Là gì?                 │ Tham số học được │ Output của mỗi layer │
+│ Thay đổi mỗi batch?   │ ❌ Không         │ ✅ Có                │
+│ Biết trước phân phối?  │ ✅ Có (sau train)│ ❌ Không (phụ thuộc  │
+│                        │                  │    vào input)        │
+│ Quantize scheme        │ Per-channel      │ Per-tensor           │
+│ Observer cần gì?       │ Đọc trực tiếp    │ Thu thập qua nhiều   │
+│                        │ weight values    │ batch → running stats│
+│ q_range thường dùng    │ [-128, 127]      │ [0, 255]             │
+│                        │ (signed, vì      │ (unsigned, vì sau    │
+│                        │  weight có âm)   │  ReLU luôn ≥ 0)     │
+└────────────────────────┴──────────────────┴──────────────────────┘
+```
+
+### 5.3 Activation bị đối xử thế nào trong FORWARD?
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  MÃ GIẢ — XỬ LÝ ACTIVATION TRONG FORWARD:                      │
+│                                                                  │
+│  function QAT_CONV2D_FORWARD(input_activation, weight, bias):   │
+│                                                                  │
+│      // ① Observer THEO DÕI activation                          │
+│      //    Cập nhật running_min, running_max                    │
+│      if training:                                                │
+│          act_observer.running_min = min(running_min, act.min())  │
+│          act_observer.running_max = max(running_max, act.max()) │
+│                                                                  │
+│      // ② Tính scale, zero_point cho activation                 │
+│      act_scale, act_zp = act_observer.compute_qparams()         │
+│                                                                  │
+│      // ③ FAKE QUANTIZE activation                              │
+│      //    quantize → dequantize ngay → vẫn FP32 nhưng "noisy" │
+│      act_fq = fake_quantize(input_activation,                    │
+│                              act_scale, act_zp,                  │
+│                              q_min=0, q_max=255)                │
+│                                                                  │
+│      // ④ FAKE QUANTIZE weight (tương tự)                       │
+│      w_fq = fake_quantize(weight, w_scale, w_zp,                │
+│                            q_min=-128, q_max=127)               │
+│                                                                  │
+│      // ⑤ Tính output bằng giá trị ĐÃ fake-quantize            │
+│      output = conv2d(act_fq, w_fq, bias)                        │
+│                                                                  │
+│      return output // output chứa "quantization noise"          │
+│                    // → loss sẽ phản ánh ảnh hưởng              │
+│                    //   của quantization                        │
+│                    // → backward sẽ cập nhật weight             │
+│                    //   để bù đắp noise này                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 Activation và Weight bị đối xử thế nào trong BACKWARD?
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  MÃ GIẢ — BACKWARD PASS TRONG QAT:                              │
+│                                                                  │
+│  // Loss đã tính ở forward, bây giờ backward:                   │
+│  // Gradient chảy ngược từ loss → output → ... → input          │
+│                                                                  │
+│  ════════════════════════════════════════════════════════════     │
+│  GRADIENT QUA ACTIVATION FAKE QUANTIZE:                          │
+│  ════════════════════════════════════════════════════════════     │
+│                                                                  │
+│  // Phép round() có gradient = 0 → không thể train              │
+│  // → Dùng STE: "giả vờ" round() là identity function          │
+│                                                                  │
+│  grad_act = grad_output                   // STE: chuyển thẳng  │
+│  NHƯNG: nếu activation bị CLAMP (ngoài [q_min, q_max]):        │
+│    grad_act = 0                           // chặn gradient      │
+│                                                                  │
+│  // Nói cách khác:                                              │
+│  if activation nằm TRONG vùng quantizable:                      │
+│      grad chảy qua bình thường ← model có thể học               │
+│  else (activation bị saturate):                                  │
+│      grad = 0 ← "đây là vùng chết, không cập nhật"              │
+│                                                                  │
+│  ════════════════════════════════════════════════════════════     │
+│  GRADIENT QUA WEIGHT FAKE QUANTIZE:                              │
+│  ════════════════════════════════════════════════════════════     │
+│                                                                  │
+│  // Cùng cơ chế STE:                                            │
+│  grad_weight = grad_output   // STE: chuyển thẳng               │
+│  if weight BỊ CLAMP:                                             │
+│      grad_weight = 0         // chặn gradient                   │
+│                                                                  │
+│  // SAU KHI có gradient, optimizer cập nhật weight:              │
+│  weight_fp32 = weight_fp32 - lr * grad_weight    // FP32!       │
+│                                                                  │
+│  // Ở epoch tiếp theo, weight_fp32 sẽ lại bị fake_quantize     │
+│  // → model dần dần học cách điều chỉnh weight                  │
+│  //   sao cho KHI BỊ QUANTIZE vẫn cho kết quả tốt              │
+│                                                                  │
+│  ════════════════════════════════════════════════════════════     │
+│  TÓM TẮT:                                                       │
+│  ════════════════════════════════════════════════════════════     │
+│                                                                  │
+│  ① Weight được LƯU TRỮ ở FP32 (master copy)                    │
+│  ② Forward: weight bị fake_quantize → round → noisy output      │
+│  ③ Backward: gradient chảy QUA fake_quantize nhờ STE            │
+│  ④ Optimizer cập nhật FP32 weight bằng gradient                 │
+│  ⑤ Vòng lặp tiếp: weight FP32 mới → lại bị fake_quantize      │
+│  → Model học cách: "weight nào bền vững khi bị round?"          │
+│                                                                  │
+│  Giống như tập luyện chạy với quả tạ ở chân (fake quantize noise)│
+│  → khi bỏ tạ (deploy INT8), chạy nhanh mà vẫn khoẻ (accurate) │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 5.5 Hình dung toàn cảnh: một training step QAT
+
+```
+┌═══════════════════════════════════════════════════════════════════════┐
+║                   MỘT TRAINING STEP TRONG QAT                       ║
+╠═══════════════════════════════════════════════════════════════════════╣
+║                                                                       ║
+║  ┌─────────┐                                                         ║
+║  │  Batch  │  images (FP32)                                          ║
+║  └────┬────┘                                                         ║
+║       │                                                               ║
+║       ▼                                                               ║
+║  ╔════════════════════╗                                               ║
+║  ║  QATConv2d Layer 1 ║                                               ║
+║  ╠════════════════════╣                                               ║
+║  ║                    ║                                               ║
+║  ║  act_fq = FQ(x)   ║ ← activation bị fake quantize               ║
+║  ║  w_fq = FQ(w)     ║ ← weight bị fake quantize                   ║
+║  ║  out = conv(act_fq,║                                              ║
+║  ║          w_fq)     ║ ← tính với giá trị "noisy"                  ║
+║  ║                    ║                                               ║
+║  ╚════════╤═══════════╝                                               ║
+║           │                                                           ║
+║           ▼                                                           ║
+║       ReLU + Pool                                                     ║
+║           │                                                           ║
+║           ▼                                                           ║
+║  ╔════════════════════╗                                               ║
+║  ║  QATConv2d Layer 2 ║  (tương tự Layer 1)                          ║
+║  ╚════════╤═══════════╝                                               ║
+║           │                                                           ║
+║           ▼                                                           ║
+║  ╔════════════════════╗                                               ║
+║  ║  QATLinear Layer 3 ║  (tương tự, FC)                              ║
+║  ╚════════╤═══════════╝                                               ║
+║           │                                                           ║
+║           ▼                                                           ║
+║  ╔════════════════════╗                                               ║
+║  ║  QATLinear Layer 4 ║  (output layer)                              ║
+║  ╚════════╤═══════════╝                                               ║
+║           │                                                           ║
+║           ▼                                                           ║
+║     ┌──────────┐                                                      ║
+║     │   Loss   │  = CrossEntropy(output, labels)                     ║
+║     └────┬─────┘                                                      ║
+║          │                                                            ║
+║          │ loss.backward()                                            ║
+║          │                                                            ║
+║          ▼ ▼ ▼                                                        ║
+║                                                                       ║
+║     ╔═══════════════════════════════════════════╗                     ║
+║     ║  BACKWARD — gradient chảy ngược          ║                     ║
+║     ╠═══════════════════════════════════════════╣                     ║
+║     ║                                           ║                     ║
+║     ║  Qua FQ(weight):                          ║                     ║
+║     ║    ∂L/∂w = ∂L/∂out × STE_mask             ║                     ║
+║     ║    w_fp32 -= lr × ∂L/∂w  ← CẬP NHẬT FP32 ║                     ║
+║     ║                                           ║                     ║
+║     ║  Qua FQ(activation):                      ║                     ║
+║     ║    ∂L/∂x = ∂L/∂out × STE_mask             ║                     ║
+║     ║    → chảy tiếp về layer trước             ║                     ║
+║     ║                                           ║                     ║
+║     ╚═══════════════════════════════════════════╝                     ║
+║                                                                       ║
+║     optimizer.step()  →  weights cập nhật (FP32)                     ║
+║     → Epoch tiếp → weight lại bị FQ → model thích nghi dần          ║
+║                                                                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## 6. Straight-Through Estimator (STE)
+
+### 6.1 Vấn đề
+
+```
+y = round(x)
+
+dy/dx = ?
+
+Toán học: dy/dx = 0   (hầu như mọi nơi)
+                       (vì round là hàm bậc thang, đạo hàm = 0)
+
+→ Nếu dùng gradient thật: mọi gradient = 0 → training KHÔNG HỌC GÌ
+```
+
+### 6.2 STE — giải pháp "hack" nhưng hiệu quả
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  STRAIGHT-THROUGH ESTIMATOR:                                     │
+│                                                                  │
+│  Forward:   y = round(x)           ← dùng round() thật         │
+│  Backward:  ∂L/∂x = ∂L/∂y × 1     ← GIẢ VỜ round là identity  │
+│                                                                  │
+│  Tức là:                                                         │
+│    Forward:   f(x) = round(x)     // hàm bậc thang              │
+│    Backward:  f'(x) ≈ 1           // giả vờ f(x) = x           │
+│                                                                  │
+│  Gradient "đi thẳng qua" (straight through) phép round          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 6.3 STE có thêm clamping
+
+Trong thực tế, STE cũng **chặn gradient** ở vùng bị clamp:
+
+```
+                    ┌── gradient = 0 (vùng clamp trên)
+                    │
+  grad ────────────[████████████████]──────────── grad = 0
+                   ↑                ↑
+                 q_min            q_max
+                 (vùng chết)    (vùng chết)
+                   │                │
+                   └── gradient chảy qua bình thường ──┘
+
+  Nếu x ∈ [q_min_real, q_max_real]: grad qua bình thường
+  Nếu x ∉ [q_min_real, q_max_real]: grad = 0  (bị clip)
+```
+
+### 6.4 Implement trong code (project này)
 
 ```python
-# QConfig = cấu hình cho quantization
-qconfig = torch.ao.quantization.get_default_qat_qconfig("x86")
+class FakeQuantizeFunction(torch.autograd.Function):
 
-# Bên trong, qconfig chỉ định:
-# - activation observer: theo dõi phạm vi giá trị activation
-# - weight observer:     theo dõi phạm vi giá trị weight
-# - quant scheme:        per-tensor hay per-channel
-# - dtype:               quint8 (unsigned) hoặc qint8 (signed)
-```
+    @staticmethod
+    def forward(ctx, x, scale, zero_point, q_min, q_max):
+        x_int = torch.clamp(torch.round(x / scale) + zero_point, q_min, q_max)
+        x_fake = (x_int - zero_point) * scale
 
-**Các loại observer thường gặp:**
+        # Lưu lại để backward biết vùng nào bị clamp
+        q_min_real = (q_min - zero_point) * scale
+        q_max_real = (q_max - zero_point) * scale
+        ctx.save_for_backward(x, q_min_real, q_max_real)
 
-| Observer | Cách hoạt động |
-|----------|----------------|
-| `MinMaxObserver` | Theo dõi min/max tuyệt đối → tính scale |
-| `MovingAverageMinMaxObserver` | Giống trên nhưng dùng trung bình động (ít ảnh hưởng bởi outlier) |
-| `HistogramObserver` | Xây histogram → tìm ngưỡng tối ưu bằng KL-divergence |
-| `PerChannelMinMaxObserver` | Min/max riêng cho từng channel (cho weights) |
+        return x_fake
 
-### 4.4 Fuse Modules (Hợp nhất các lớp)
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, q_min_real, q_max_real = ctx.saved_tensors
 
-Trước khi QAT, ta cần **fuse** (hợp nhất) các cặp layer liền kề:
+        # STE: chỉ cho gradient qua vùng KHÔNG bị clamp
+        mask = (x >= q_min_real) & (x <= q_max_real)
+        grad_input = grad_output * mask.float()
 
-```
-Trước fuse:                    Sau fuse:
-┌─────────┐                    ┌───────────────┐
-│ Conv2d  │                    │ ConvReLU2d    │  ← một module duy nhất
-├─────────┤        ────►       │ (fused)       │
-│ ReLU    │                    └───────────────┘
-└─────────┘
-```
-
-**Tại sao cần fuse?**
-
-1. **Chính xác hơn**: Observer đo phạm vi **sau ReLU** (luôn ≥ 0), thay vì đo riêng Conv (có thể âm) và ReLU
-2. **Nhanh hơn**: Giảm một operation trong inference
-3. **Các cặp có thể fuse**: `Conv+ReLU`, `Conv+BN+ReLU`, `Linear+ReLU`, `BN+ReLU`
-
-```python
-# Trong model.py:
-torch.ao.quantization.fuse_modules(
-    self,
-    [
-        ["conv1", "relu1"],    # Conv2d + ReLU → ConvReLU2d
-        ["conv2", "relu2"],    # Conv2d + ReLU → ConvReLU2d
-        ["fc1",   "relu3"],    # Linear + ReLU → LinearReLU
-    ],
-    inplace=True,
-)
+        return grad_input, None, None, None, None
 ```
 
 ---
 
-## 5. Kiến trúc mô hình trong project này
+## 7. Observer — thu thập thống kê
 
-### 5.1 SimpleCNN (Baseline FP32)
+### 7.1 Vai trò
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                       SimpleCNN                               │
-│                                                               │
-│  Input: 1×28×28 (MNIST grayscale)                            │
-│                                                               │
-│  ┌──────────────┐   ┌──────┐   ┌───────────┐                │
-│  │ Conv2d       │──►│ ReLU │──►│ MaxPool2d │  → 32×14×14    │
-│  │ 1→32, 3×3   │   └──────┘   │ kernel=2  │                │
-│  └──────────────┘              └───────────┘                │
-│                                                               │
-│  ┌──────────────┐   ┌──────┐   ┌───────────┐                │
-│  │ Conv2d       │──►│ ReLU │──►│ MaxPool2d │  → 64×7×7     │
-│  │ 32→64, 3×3  │   └──────┘   │ kernel=2  │                │
-│  └──────────────┘              └───────────┘                │
-│                                                               │
-│  Flatten → 64×7×7 = 3136                                     │
-│                                                               │
-│  ┌──────────────┐   ┌──────┐                                 │
-│  │ Linear       │──►│ ReLU │  → 128                          │
-│  │ 3136→128     │   └──────┘                                 │
-│  └──────────────┘                                            │
-│                                                               │
-│  ┌──────────────┐                                            │
-│  │ Linear       │  → 10 (classes 0-9)                        │
-│  │ 128→10       │                                            │
-│  └──────────────┘                                            │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### 5.2 QuantizedCNN (QAT-ready)
-
-Kiến trúc **giống hệt** SimpleCNN, chỉ thêm hai thành phần:
+Observer **theo dõi** giá trị thực tế của activation/weight qua nhiều batch để tính **scale** và **zero_point** tối ưu.
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                      QuantizedCNN                             │
-│                                                               │
-│  ┌───────────┐  ← THÊM: Chuyển FP32 → fake-quantized       │
-│  │ QuantStub │                                                │
-│  └─────┬─────┘                                                │
-│        │                                                      │
-│   (Cùng kiến trúc CNN như SimpleCNN)                         │
-│        │                                                      │
-│  ┌─────┴───────┐  ← THÊM: Chuyển fake-quantized → FP32     │
-│  │ DeQuantStub │                                              │
-│  └─────────────┘                                              │
-│                                                               │
-│  + fuse_model() method để fuse Conv+ReLU, Linear+ReLU        │
-└───────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  MÃ GIẢ — MIN-MAX OBSERVER:                                     │
+│                                                                  │
+│  class MinMaxObserver:                                           │
+│      running_min = +∞                                            │
+│      running_max = -∞                                            │
+│                                                                  │
+│      function OBSERVE(tensor):                                   │
+│          running_min = min(running_min, tensor.min())            │
+│          running_max = max(running_max, tensor.max())            │
+│                                                                  │
+│      function COMPUTE_QPARAMS():                                │
+│          range = running_max - running_min                       │
+│          scale = range / (q_max - q_min)                        │
+│          zero_point = q_min - round(running_min / scale)        │
+│          zero_point = clamp(zero_point, q_min, q_max)           │
+│          return scale, zero_point                                │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**Tại sao cần hai model riêng?**
-- `SimpleCNN`: dùng cho training FP32 bình thường, không có overhead từ quant stubs
-- `QuantizedCNN`: chứa QuantStub/DeQuantStub và fuse_model() cần thiết cho QAT
-- Cả hai **chia chung tên layer** nên có thể load state_dict từ SimpleCNN sang QuantizedCNN
+### 7.2 Tại sao cần observer cho activation?
+
+- **Weight**: đã biết giá trị → có thể tính scale/zp ngay
+- **Activation**: thay đổi theo input → phải **chạy nhiều batch** để estimate phân phối
+
+```
+Batch 1:  activation range = [-0.3, 0.8]
+Batch 2:  activation range = [-0.2, 1.1]   ← max mới!
+Batch 3:  activation range = [-0.5, 0.9]   ← min mới!
+...
+Sau N batch: running_min = -0.5, running_max = 1.1
+           → scale = (1.1 - (-0.5)) / 255 ≈ 0.00627
+```
 
 ---
 
-## 6. Giải thích từng bước trong code
+## 8. Kiến trúc from-scratch trong project
 
-### 6.1 Bước 1: Train baseline (`train_baseline.py`)
-
-```
-Mục đích: Có một mô hình FP32 đã train tốt → làm "điểm xuất phát" cho QAT
-```
-
-**Luồng thực thi:**
+### 8.1 Cây module
 
 ```
-1. Tải MNIST dataset
-       ↓
-2. Khởi tạo SimpleCNN
-       ↓
-3. Train 5 epochs với Adam optimizer (lr=1e-3)
-       ↓
-4. Đánh giá trên test set → ~99% accuracy
-       ↓
-5. Lưu state_dict → baseline_model.pth
+model.py — KHÔNG dùng torch.ao.quantization
+│
+├── FakeQuantizeFunction      ← torch.autograd.Function (STE)
+│     Implement quantize + dequantize trong forward
+│     Implement STE trong backward
+│
+├── MinMaxObserver            ← nn.Module
+│     Theo dõi running min/max
+│     Tính scale, zero_point
+│
+├── FakeQuantizeModule        ← nn.Module (bọc Function + Observer)
+│     Training: observe → compute_qparams → fake_quantize
+│     Eval:     compute_qparams → fake_quantize (không observe)
+│
+├── SimpleCNN                 ← nn.Module (baseline FP32)
+│     Conv2d → ReLU → Pool → Conv2d → ReLU → Pool → FC → FC
+│
+├── QATConv2d                 ← nn.Module (thay thế Conv2d)
+│     ├── activation_fake_quant: FakeQuantizeModule [0, 255]
+│     ├── weight_fake_quant:     FakeQuantizeModule [-128, 127]
+│     └── conv:                  nn.Conv2d
+│
+├── QATLinear                 ← nn.Module (thay thế Linear)
+│     ├── activation_fake_quant: FakeQuantizeModule [0, 255]
+│     ├── weight_fake_quant:     FakeQuantizeModule [-128, 127]
+│     └── linear:                nn.Linear
+│
+└── QATCNN                    ← nn.Module (QAT version of SimpleCNN)
+      Sử dụng QATConv2d/QATLinear thay cho Conv2d/Linear
+      + load_pretrained()       ← map keys từ SimpleCNN
+      + get_quantization_stats() ← in scale/zp cho giáo dục
 ```
 
-**Code quan trọng:**
+### 8.2 Tại sao không dùng `torch.ao.quantization`?
 
-```python
-# Normalize MNIST theo mean/std chuẩn
-transforms.Normalize((0.1307,), (0.3081,))
-
-# Lưu state_dict (không lưu toàn bộ model)
-# → Nhẹ hơn, portable hơn, tránh vấn đề serialization
-torch.save(model.state_dict(), "baseline_model.pth")
-```
-
-### 6.2 Bước 2: QAT fine-tuning (`train_qat.py`)
-
-Đây là **phần quan trọng nhất**. Luồng thực thi chi tiết:
-
-```
-╔═══════════════════════════════════════════════════════════════════╗
-║                    QAT Pipeline — Từng bước                      ║
-╠═══════════════════════════════════════════════════════════════════╣
-║                                                                   ║
-║  Step 1: Load pre-trained weights                                ║
-║  ─────────────────────────────────                               ║
-║  model = QuantizedCNN()                                          ║
-║  model.load_state_dict(baseline_weights, strict=False)           ║
-║                                                                   ║
-║  → strict=False: bỏ qua quant/dequant keys không có              ║
-║    trong SimpleCNN (vì SimpleCNN không có QuantStub)             ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 2: Fuse modules                                            ║
-║  ────────────────────                                            ║
-║  model.fuse_model()                                              ║
-║                                                                   ║
-║  Trước:  conv1 → relu1 → pool1 → conv2 → relu2 → pool2         ║
-║  Sau:    conv1_relu1 → pool1 → conv2_relu2 → pool2              ║
-║          (ConvReLU2d)         (ConvReLU2d)                       ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 3: Set QConfig                                             ║
-║  ───────────────────                                             ║
-║  model.qconfig = get_default_qat_qconfig("x86")                 ║
-║                                                                   ║
-║  → Chỉ định observer loại nào cho activation & weight            ║
-║  → "x86": tối ưu cho CPU Intel/AMD                              ║
-║  → Alternatives: "qnnpack" (ARM), "fbgemm" (Facebook)           ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 4: prepare_qat()                                           ║
-║  ─────────────────────                                           ║
-║  quant.prepare_qat(model, inplace=True)                          ║
-║                                                                   ║
-║  → Chèn FakeQuantize modules vào mỗi layer                      ║
-║  → Mỗi forward pass sẽ: quantize → dequantize (simulate INT8)   ║
-║  → Observer bắt đầu thu thập statistics                          ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 5: Fine-tune (3 epochs)                                    ║
-║  ────────────────────────────                                    ║
-║  for epoch in range(3):                                          ║
-║      train_one_epoch(model, ...)                                 ║
-║                                                                   ║
-║  → Learning rate thấp hơn (1e-4 vs 1e-3) vì chỉ fine-tune      ║
-║  → Mô hình học cách điều chỉnh weights để bù quantization noise ║
-║  → Observer cập nhật scale/zero_point liên tục                   ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 6: convert()                                               ║
-║  ─────────────────                                               ║
-║  model.eval()                       ← BẮT BUỘC trước convert    ║
-║  quantized = quant.convert(model)                                ║
-║                                                                   ║
-║  → Thay FakeQuantize bằng quantized operators thực               ║
-║  → nn.Conv2d → nn.quantized.Conv2d  (INT8 arithmetic)           ║
-║  → nn.Linear → nn.quantized.Linear  (INT8 arithmetic)           ║
-║  → Mô hình bây giờ thực sự chạy INT8!                           ║
-║                                                                   ║
-║──────────────────────────────────────────────────────────────────║
-║                                                                   ║
-║  Step 7: Save                                                    ║
-║  ────────                                                        ║
-║  torch.save(quantized.state_dict(), "qat_model.pth")            ║
-║                                                                   ║
-║  → File nhỏ hơn ~3-4× so với baseline_model.pth                 ║
-║                                                                   ║
-╚═══════════════════════════════════════════════════════════════════╝
-```
-
-### 6.3 Bước 3: So sánh (`compare.py`)
-
-```
-1. Load SimpleCNN ← baseline_model.pth
-2. Load QuantizedCNN ← qat_model.pth
-   (phải reproduce cùng pipeline: fuse → prepare_qat → convert → load)
-3. Đo: file size, test accuracy, inference latency
-4. In bảng so sánh
-```
-
-**Lưu ý quan trọng**: Khi load mô hình quantized, bạn phải **reproduce toàn bộ pipeline** (fuse → prepare_qat → convert) trước khi load state_dict. Đây là vì cấu trúc module thay đổi sau convert().
+| `torch.ao.quantization` | From-scratch (project này) |
+|:---:|:---:|
+| "Black box" — gọi API, không thấy bên trong | Thấy **mọi dòng code** quantize/dequantize |
+| Observer, FakeQuantize là C++ internals | Observer, FakeQuantize là **Python thuần** |
+| Khó debug & hiểu flow | **Đặt breakpoint**, print từng bước |
+| Tốt cho production | Tốt cho **học tập** |
 
 ---
 
-## 7. Kết quả mẫu & phân tích
+## 9. Giải thích code từng bước
 
-### 7.1 Bảng kết quả dự kiến
+### 9.1 `train_baseline.py` — baseline FP32
 
 ```
-════════════════════════════════════════════════════════════════════
-  📊  Model Comparison: FP32 vs QAT INT8
-════════════════════════════════════════════════════════════════════
-Metric                         FP32 Baseline        QAT INT8           Δ
-──────────────────────────────────────────────────────────────────────
-Model file size (KB)                  ~800            ~200-300      ~25-35%
-Test accuracy (%)                    ~99.1             ~98.9        -0.2
-Avg batch latency (ms)                ~5.0              ~3.0        -40%
-──────────────────────────────────────────────────────────────────────
+1. Load MNIST → normalize (mean=0.1307, std=0.3081)
+2. SimpleCNN: Conv(1→32) → ReLU → Pool → Conv(32→64) → ReLU → Pool → FC(3136→128) → ReLU → FC(128→10)
+3. Train 5 epochs, Adam(lr=1e-3)
+4. Save state_dict → baseline_model.pth
+5. Expected: ~99% accuracy
 ```
 
-### 7.2 Phân tích
+### 9.2 `train_qat.py` — QAT from scratch
 
-**Kích thước mô hình:**
-- FP32: mỗi parameter chiếm 4 bytes (float32)
-- INT8: mỗi parameter chiếm 1 byte → giảm ~4×
-- Thực tế giảm ~3× vì có thêm metadata (scale, zero_point)
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  PSEUDOCODE — TOÀN BỘ QAT PIPELINE:                             │
+│                                                                  │
+│  // 1. Tạo QATCNN (mỗi Conv2d/Linear → QATConv2d/QATLinear)    │
+│  qat_model = QATCNN()                                           │
+│                                                                  │
+│  // 2. Load weight FP32 từ baseline                              │
+│  qat_model.load_pretrained(baseline_state_dict)                  │
+│  //    mapping: "conv1.weight" → "conv1.conv.weight"             │
+│  //             "fc1.weight"   → "fc1.linear.weight"             │
+│                                                                  │
+│  // 3. Fine-tune 3 epochs                                        │
+│  for epoch = 1 to 3:                                             │
+│      for batch in train_data:                                    │
+│          output = qat_model(batch)      // forward với FQ        │
+│          loss = cross_entropy(output)                            │
+│          loss.backward()                // STE backward          │
+│          optimizer.step()               // cập nhật FP32 weight  │
+│                                                                  │
+│  // 4. In quantization stats                                     │
+│  for each FakeQuantizeModule in model:                           │
+│      print(layer_name, scale, zero_point, observed_min, max)     │
+│                                                                  │
+│  // 5. Save model                                                │
+│  save(qat_model.state_dict())   // vẫn FP32 weights +           │
+│                                  // quantization parameters      │
+│                                  // (scale, zp) để convert sau  │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-**Accuracy:**
-- Giảm rất ít (~0.1-0.3%) nhờ QAT cho phép mô hình thích nghi
-- Với PTQ thuần tuý, accuracy có thể giảm ~1-2%
+### 9.3 `compare.py` — so sánh
 
-**Latency:**
-- Phép tính INT8 nhanh hơn FP32 trên CPU
-- Tốc độ tăng phụ thuộc vào phần cứng (CPU có hỗ trợ AVX-512 VNNI sẽ nhanh hơn)
+So sánh baseline (SimpleCNN) và QAT (QATCNN): file size, accuracy, latency.
 
 ---
 
-## 8. Các câu hỏi thường gặp (FAQ)
+## 10. FAQ
 
-### Q1: QAT chỉ chạy trên CPU, không chạy trên GPU?
+### Q1: QAT model vẫn lưu FP32 — thì nhỏ hơn ở đâu?
 
-**Đúng** (với PyTorch eager-mode quantization). Đây là hạn chế của `torch.ao.quantization`:
-- **Training QAT**: chạy trên CPU (chậm hơn nhưng cần ít epoch)
-- **Inference INT8**: chạy trên CPU
+Đúng — trong project này, `qat_model.pth` vẫn lưu FP32 vì ta chưa implement conversion thật sang INT8. Trong production:
+1. Sau QAT, bạn **quantize weight thật** bằng scale/zp đã học
+2. Lưu weight dưới dạng INT8 → file nhỏ ~4×
+3. Dùng INT8 inference runtime (ONNX Runtime, TFLite, etc.)
 
-Để quantize cho GPU, dùng:
-- `torch.compile` + `torchao` (PyTorch 2.x+)
-- TensorRT (NVIDIA)
-- ONNX Runtime
+Project này tập trung vào **quá trình training** (fake quantize + STE), không phải inference runtime.
 
-### Q2: Tại sao cần `model.eval()` trước `convert()`?
+### Q2: Tại sao activation dùng [0, 255] mà weight dùng [-128, 127]?
 
-- `convert()` cần model ở eval mode để **đóng băng** BatchNorm statistics
-- Nếu không, BN sẽ tiếp tục cập nhật running mean/variance → kết quả không ổn định
+- **Activation sau ReLU**: luôn ≥ 0 → dùng **unsigned** INT8 `[0, 255]`
+- **Weight**: có cả giá trị âm → dùng **signed** INT8 `[-128, 127]`
 
-### Q3: Khi nào nên dùng PTQ thay vì QAT?
+### Q3: Per-channel vs per-tensor quantization?
 
-| Tình huống | Nên dùng |
-|-----------|---------|
-| Mô hình lớn (ResNet-50+) | PTQ thường đủ tốt |
-| Accuracy giảm < 1% với PTQ | PTQ |
-| Accuracy giảm > 1% với PTQ | **QAT** |
-| Mô hình nhỏ (MobileNet, CNN nhỏ) | **QAT** (nhạy hơn với quantization) |
-| Không có training pipeline | PTQ |
+- **Per-tensor**: một cặp (scale, zp) cho **toàn bộ tensor** → đơn giản, project này dùng
+- **Per-channel**: mỗi output channel có (scale, zp) riêng → chính xác hơn, production dùng
 
-### Q4: `strict=False` khi load state_dict nghĩa là gì?
+### Q4: Có cần pre-train baseline trước QAT không?
 
-```python
-model.load_state_dict(state_dict, strict=False)
-```
-
-- `strict=True` (mặc định): yêu cầu **tất cả keys phải khớp** chính xác
-- `strict=False`: **bỏ qua keys thừa/thiếu**
-
-Trong project này, `QuantizedCNN` có thêm `quant` và `dequant` modules mà `SimpleCNN` không có → cần `strict=False`.
-
-### Q5: Per-tensor vs Per-channel quantization là gì?
-
-- **Per-tensor**: một cặp (scale, zero_point) cho **toàn bộ tensor**
-- **Per-channel**: mỗi **output channel** có cặp (scale, zero_point) riêng
-
-```
-Per-tensor:    toàn bộ weight tensor chia chung 1 scale
-Per-channel:   channel 0 có scale_0, channel 1 có scale_1, ...
-```
-
-Per-channel cho accuracy tốt hơn (đặc biệt với weights), nhưng phức tạp hơn.
-PyTorch mặc định dùng per-channel cho weights và per-tensor cho activations.
+**Khuyến khích** nhưng không bắt buộc:
+- Có pre-train: QAT chỉ cần vài epoch fine-tuning → nhanh
+- Không pre-train: QAT phải train từ đầu → lâu hơn, nhưng vẫn hoạt động
 
 ---
 
-## 9. Tài liệu tham khảo
+## 11. Tài liệu tham khảo
 
 ### Papers
-1. **Jacob et al. (2018)** — [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877)
-   - Paper gốc giới thiệu QAT, được Google áp dụng cho MobileNet
-2. **Krishnamoorthi (2018)** — [Quantizing deep convolutional networks for efficient inference: A whitepaper](https://arxiv.org/abs/1806.08342)
-   - Tổng quan toàn diện về các phương pháp quantization
+1. **Jacob et al. (2018)** — [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877) — Paper gốc QAT từ Google
+2. **Krishnamoorthi (2018)** — [Quantizing deep convolutional networks for efficient inference](https://arxiv.org/abs/1806.08342) — Tổng quan quantization
 
-### PyTorch Documentation
-3. [PyTorch Quantization Overview](https://pytorch.org/docs/stable/quantization.html)
-4. [Static Quantization Tutorial](https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html)
-5. [QAT Tutorial with MobileNetV2](https://pytorch.org/tutorials/prototype/quantization_in_pytorch_2_0_export_tutorial.html)
+### Documentation
+3. [PyTorch Quantization](https://pytorch.org/docs/stable/quantization.html)
+4. [PyTorch QAT Tutorial](https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html)
 
-### Blog Posts
-6. [Introduction to Quantization on PyTorch](https://pytorch.org/blog/introduction-to-quantization-on-pytorch/)
-7. [Practical Quantization in PyTorch](https://pytorch.org/blog/quantization-in-practice/)
-
----
-
-> 📝 **Ghi chú**: Tài liệu này được thiết kế cho mục đích giáo dục. Trong production, hãy tham khảo thêm các kỹ thuật nâng cao như mixed-precision quantization, quantization-aware distillation, và hardware-specific optimization.
+### Blog
+5. [Introduction to Quantization on PyTorch](https://pytorch.org/blog/introduction-to-quantization-on-pytorch/)
+6. [Practical Quantization in PyTorch](https://pytorch.org/blog/quantization-in-practice/)
