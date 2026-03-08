@@ -69,15 +69,17 @@ class FakeQuantizeFunction(torch.autograd.Function):
         x_fake_quantized = (x_int - zero_point) * scale
 
         # Save for backward: we need to know which values were clipped
-        q_min_real = (q_min - zero_point) * scale
-        q_max_real = (q_max - zero_point) * scale
-        ctx.save_for_backward(x, q_min_real, q_max_real)
+        ctx.q_min_real = (q_min - zero_point) * scale
+        ctx.q_max_real = (q_max - zero_point) * scale
+        ctx.save_for_backward(x)
 
         return x_fake_quantized
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, q_min_real, q_max_real = ctx.saved_tensors
+        x, = ctx.saved_tensors
+        q_min_real = ctx.q_min_real
+        q_max_real = ctx.q_max_real
 
         # Straight-Through Estimator with gradient clipping:
         # Pass gradient through ONLY where x was within quantizable range.
@@ -374,3 +376,105 @@ class QATCNN(nn.Module):
                     "observed_max": module.observer.running_max.item(),
                 })
         return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PART 7: BitNet 1.58b — Alternative Schema (Ternary Weights {-1, 0, 1})
+# ═══════════════════════════════════════════════════════════════════════════
+
+def weight_quant_bitnet(w):
+    """
+    BitNet 1.58b Weight Quantization:
+    W_q = clamp(round(W / gamma), -1, 1)
+    where gamma = mean(|W|)
+
+    Returns the fake-quantized weights (still FP32 but only contains {-gamma, 0, gamma})
+    """
+    # Tính scale bằng absolute mean
+    gamma = w.abs().mean().clamp(min=1e-8)
+    
+    # Quantize về {-1, 0, 1}
+    w_scaled = w / gamma
+    w_int = torch.clamp(torch.round(w_scaled), -1, 1)
+    
+    # Dequantize về FP32 để gradient có thể scale đúng
+    w_fake_quant = w_int * gamma
+    
+    # Dùng STE để gradient chảy thẳng qua đoạn làm tròn
+    # (Ở BitNet gốc người ta hay viết: output = forward_val + input - input.detach())
+    # Kỹ thuật này tương đương với STE autograd:
+    w_out = w + (w_fake_quant - w).detach()
+    return w_out
+
+
+def activation_quant_bitnet(x, num_bits=8):
+    """
+    BitNet absmax quantization cho activation (thường dùng 8-bit).
+    Trái với Weight (ternary), Activation thường giữ 8-bit để tránh mất quá nhiều thông tin.
+    """
+    q_max = (2 ** (num_bits - 1)) - 1  # 127
+    gamma = x.abs().max().clamp(min=1e-8)
+    scale = q_max / gamma
+    
+    x_int = torch.clamp(torch.round(x * scale), -q_max, q_max)
+    x_fake_quant = x_int / scale
+    
+    # STE
+    x_out = x + (x_fake_quant - x).detach()
+    return x_out
+
+
+class BitLinear(nn.Module):
+    """
+    Linear layer sử dụng schema của BitNet 1.58b:
+    - Weights: Ternary {-1, 0, 1}
+    - Activations: 8-bit
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        # Bỏ qua LayerNorm để code gọn, trong paper thực tế có RMSNorm trước khi lượng tử hoá
+
+    def forward(self, x):
+        x_quant = activation_quant_bitnet(x)
+        w_quant = weight_quant_bitnet(self.linear.weight)
+        return F.linear(x_quant, w_quant, self.linear.bias)
+
+
+class BitConv2d(nn.Module):
+    """
+    Conv2d với BitNet schema (dùng cho CNN demo).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+
+    def forward(self, x):
+        x_quant = activation_quant_bitnet(x)
+        w_quant = weight_quant_bitnet(self.conv.weight)
+        return F.conv2d(x_quant, w_quant, self.conv.bias, 
+                        self.conv.stride, self.conv.padding)
+
+
+class BitNetCNN(nn.Module):
+    """
+    CNN architecture built entirely with 1.58-bit models (BitConv2d, BitLinear).
+    """
+    def __init__(self):
+        super().__init__()
+        self.conv1 = BitConv2d(1, 32, kernel_size=3, padding=1)
+        self.conv2 = BitConv2d(32, 64, kernel_size=3, padding=1)
+        self.fc1 = BitLinear(64 * 7 * 7, 128)
+        self.fc2 = BitLinear(128, 10)
+
+    def forward(self, x):
+        # Thông thường layer đầu tiên ít khi lượng tử trọng số khắc nghiệt, 
+        # nhưng trong demo ta lượng tử mọi thứ.
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
